@@ -1,0 +1,432 @@
+// ======================================================
+// LANDSAT 8 + 9: TEMPERATURA SUPERFICIAL POR SECTOR
+// Todas las imágenes disponibles +/- 5 días
+// ======================================================
+
+
+// ------------------------------------------------------
+// 1. SECTORES
+// ------------------------------------------------------
+
+var sectores = ee.FeatureCollection(
+  'projects/ee-fernandatuesta/assets/sendero30x10m_52s'
+);
+
+print('Primer sector:', sectores.first());
+print('Lista de propiedades:', sectores.first().propertyNames());
+
+Map.addLayer(sectores, {}, 'Sectores');
+Map.centerObject(sectores);
+
+
+// ------------------------------------------------------
+// 2. FECHAS DE MUESTREO
+// ------------------------------------------------------
+
+var fechas = [
+  '2023-11-11',
+  '2023-12-11',
+  '2024-01-05',
+  '2024-01-26',
+  '2024-03-07',
+  '2024-03-29',
+  '2024-04-18',
+  '2024-05-10',
+  '2024-06-06',
+  '2024-07-18',
+  '2024-08-15',
+  '2024-09-24',
+  '2024-10-03',
+  '2024-10-26',
+  '2024-11-09',
+  '2024-12-09',
+  '2024-12-27'
+];
+
+
+// ------------------------------------------------------
+// 3. COLECCIONES LANDSAT 8 Y 9
+// ------------------------------------------------------
+
+var L8 = ee.ImageCollection(
+  'LANDSAT/LC08/C02/T1_L2'
+);
+
+var L9 = ee.ImageCollection(
+  'LANDSAT/LC09/C02/T1_L2'
+);
+
+
+// ------------------------------------------------------
+// 4. FUNCIÓN PARA PREPARAR LANDSAT
+// ------------------------------------------------------
+
+function prepararLandsat(image) {
+
+  // -----------------------------------------------
+  // QA_PIXEL
+  // -----------------------------------------------
+
+  var qa = image.select('QA_PIXEL');
+
+  // Bit 3 = nube
+  var nube = qa.bitwiseAnd(1 << 3)
+    .neq(0)
+    .rename('nube');
+
+  // Bit 4 = sombra de nube
+  var sombra = qa.bitwiseAnd(1 << 4)
+    .neq(0)
+    .rename('sombra');
+
+
+  // -----------------------------------------------
+  // MÁSCARA DE NUBES Y SOMBRAS
+  // -----------------------------------------------
+
+  var mascara = nube.not()
+    .and(sombra.not());
+
+
+  // -----------------------------------------------
+  // TEMPERATURA SUPERFICIAL
+  // -----------------------------------------------
+
+  // ST_B10 está almacenada con factor de escala.
+  // Conversión:
+  // Kelvin = ST_B10 * 0.00341802 + 149.0
+  // Celsius = Kelvin - 273.15
+
+  var temperatura = image.select('ST_B10')
+    .multiply(0.00341802)
+    .add(149.0)
+    .subtract(273.15)
+    .rename('temperatura_C')
+    .updateMask(mascara);
+
+
+  // -----------------------------------------------
+  // DEVOLVER BANDAS
+  // -----------------------------------------------
+
+  return ee.Image.cat([
+    temperatura,
+    nube,
+    sombra
+  ]).copyProperties(
+    image,
+    image.propertyNames()
+  );
+}
+
+
+// ------------------------------------------------------
+// 5. PREPARAR LAS COLECCIONES
+// ------------------------------------------------------
+
+var coleccionL8 = L8
+  .filterBounds(sectores)
+  .filter(ee.Filter.lt('CLOUD_COVER', 20))
+  .map(prepararLandsat);
+
+
+var coleccionL9 = L9
+  .filterBounds(sectores)
+  .filter(ee.Filter.lt('CLOUD_COVER', 20))
+  .map(prepararLandsat);
+
+
+// Unir Landsat 8 + Landsat 9
+
+var Landsat = coleccionL8.merge(coleccionL9);
+
+
+print(
+  'Colección Landsat LST:',
+  Landsat
+);
+
+print(
+  'Cantidad de imágenes:',
+  Landsat.size()
+);
+
+
+// ------------------------------------------------------
+// 6. FUNCIÓN: TEMPERATURA + NUBOSIDAD POR SECTOR
+// ------------------------------------------------------
+
+function datosPorSector(image, fechaMuestreo) {
+
+
+  // -----------------------------------------------
+  // BANDAS A EXTRAER
+  // -----------------------------------------------
+
+  var imagenExtraccion = image.select([
+    'temperatura_C',
+    'nube',
+    'sombra'
+  ]);
+
+
+  // -----------------------------------------------
+  // PROMEDIO POR SECTOR
+  // -----------------------------------------------
+
+  var datos = imagenExtraccion.reduceRegions({
+
+    collection: sectores,
+
+    reducer: ee.Reducer.mean(),
+
+    // Landsat Surface Temperature = 30 m
+
+    scale: 30
+
+  });
+
+
+  // -----------------------------------------------
+  // AGREGAR INFORMACIÓN DE LA IMAGEN
+  // -----------------------------------------------
+
+  return datos.map(function(feature) {
+
+    var fechaImagen = image.date();
+
+
+    // ---------------------------------------------
+    // IDENTIFICADOR DEL SECTOR
+    // ---------------------------------------------
+
+    var sector = feature.get('Sector');
+
+
+    // ---------------------------------------------
+    // PORCENTAJES DE NUBE Y SOMBRA
+    // ---------------------------------------------
+
+    var porcentajeNube = ee.Number(
+      feature.get('nube')
+    ).multiply(100);
+
+
+    var porcentajeSombra = ee.Number(
+      feature.get('sombra')
+    ).multiply(100);
+
+
+    // ---------------------------------------------
+    // RESULTADO FINAL
+    // ---------------------------------------------
+
+    return feature.set({
+
+      'Sector': sector,
+
+      'Sector_fecha': ee.Algorithms.If(
+        sector,
+        ee.String(sector)
+          .cat('_')
+          .cat(fechaMuestreo),
+        null
+      ),
+
+      'fecha_muestreo': fechaMuestreo,
+
+      'fecha_imagen': fechaImagen.format(
+        'YYYY-MM-dd'
+      ),
+
+      'diferencia_dias': fechaImagen.difference(
+        ee.Date(fechaMuestreo),
+        'day'
+      ),
+
+      'hora_UTC': fechaImagen.format(
+        'HH:mm:ss'
+      ),
+
+      'hora_local': fechaImagen
+        .advance(-3, 'hour')
+        .format('HH:mm:ss'),
+
+      'temperatura_media_C':
+        feature.get('temperatura_C'),
+
+      'porcentaje_nube_sector':
+        porcentajeNube,
+
+      'porcentaje_sombra_sector':
+        porcentajeSombra,
+
+      'ID_imagen':
+        image.id()
+
+    });
+
+  });
+
+}
+
+
+// ------------------------------------------------------
+// 7. BUSCAR IMÁGENES +/- 5 DÍAS
+// ------------------------------------------------------
+
+function buscarFecha(fechaTexto) {
+
+  var fecha = ee.Date(fechaTexto);
+
+  var inicio = fecha.advance(-5, 'day');
+
+  // +6 porque el límite superior de filterDate
+  // es exclusivo
+
+  var fin = fecha.advance(6, 'day');
+
+
+  var coleccion = Landsat
+    .filterDate(inicio, fin)
+    .filterBounds(sectores);
+
+
+  print(
+    'Fecha de muestreo:',
+    fechaTexto,
+    'Cantidad de imágenes:',
+    coleccion.size()
+  );
+
+
+  // -----------------------------------------------
+  // PROCESAR CADA IMAGEN
+  // -----------------------------------------------
+
+  return coleccion.map(function(image) {
+
+    return datosPorSector(
+      image,
+      fechaTexto
+    );
+
+  }).flatten();
+
+}
+
+
+// ------------------------------------------------------
+// 8. APLICAR A TODAS LAS FECHAS
+// ------------------------------------------------------
+
+var resultados = ee.FeatureCollection(
+  fechas.map(buscarFecha)
+).flatten();
+
+
+// ------------------------------------------------------
+// 9. ORDENAR
+// ------------------------------------------------------
+
+resultados = resultados.sort(
+  'fecha_muestreo'
+);
+
+
+// ------------------------------------------------------
+// 10. MOSTRAR RESULTADOS
+// ------------------------------------------------------
+
+print(
+  'Temperatura superficial por sector - todas las fechas +/- 5 días',
+  resultados
+);
+
+print(
+  'Cantidad total de registros:',
+  resultados.size()
+);
+
+
+// ------------------------------------------------------
+// 11. COMPROBAR COLUMNAS
+// ------------------------------------------------------
+
+print(
+  'Propiedades del primer resultado:',
+  resultados.first().propertyNames()
+);
+
+
+// ------------------------------------------------------
+// 12. MAPA DE UNA IMAGEN DE EJEMPLO
+// ------------------------------------------------------
+
+var primeraImagen = ee.Image(
+  Landsat.first()
+);
+
+var temperaturaMapa = primeraImagen.select(
+  'temperatura_C'
+);
+
+var visST = {
+  min: 10,
+  max: 40,
+  palette: [
+    '040274',
+    '235cb1',
+    '307ef3',
+    '30c8e2',
+    '3be285',
+    'b5e22e',
+    'fff705',
+    'ffd611',
+    'ffb613',
+    'ff6e08',
+    'ff0000',
+    'c21301'
+  ]
+};
+
+Map.addLayer(
+  temperaturaMapa,
+  visST,
+  'Landsat Surface Temperature'
+);
+
+
+// ------------------------------------------------------
+// 13. EXPORTAR CSV
+// ------------------------------------------------------
+
+Export.table.toDrive({
+
+  collection: resultados.select([
+
+    'Sector',
+    'Sector_fecha',
+
+    'fecha_muestreo',
+    'fecha_imagen',
+    'diferencia_dias',
+
+    'hora_UTC',
+    'hora_local',
+
+    'temperatura_media_C',
+
+    'porcentaje_nube_sector',
+    'porcentaje_sombra_sector',
+
+    'ID_imagen'
+
+  ]),
+
+  description:
+    'Landsat_ST_temperatura_por_sector',
+
+  fileFormat: 'CSV'
+
+});
